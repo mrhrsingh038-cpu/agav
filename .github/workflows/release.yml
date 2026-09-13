@@ -1,0 +1,358 @@
+name: Release
+
+on:
+  push:
+    branches: [main, beta]
+
+jobs:
+  check-version:
+    name: Check Version Change
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN }}
+          fetch-depth: 2
+      - name: Detect version bump
+        id: version
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          PREV=$(git show HEAD~1:package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version" 2>/dev/null || echo "")
+          if [ "$CURRENT" != "$PREV" ] && [ -n "$PREV" ]; then
+            # Validate version format
+            if ! echo "$CURRENT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+(\.[0-9]+)?)?$'; then
+              echo "::error::Invalid version format: $CURRENT. Expected: x.y.z or x.y.z-beta.N"
+              exit 1
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+            # Versions with a hyphen suffix (e.g. 0.2.0-beta.1) are pre-releases.
+            if echo "$CURRENT" | grep -q '-'; then
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+              echo "Version changed: $PREV → $CURRENT (pre-release)"
+            else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+              echo "Version changed: $PREV → $CURRENT (stable)"
+            fi
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No version change"
+          fi
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-latest
+          - target: darwin-x64
+            os: macos-latest
+          - target: linux-x64
+            os: ubuntu-latest
+          - target: linux-arm64
+            os: ubuntu-latest
+          # Windows binaries must be built natively on a Windows runner.
+          # Cross-compiling from Linux (--target=bun-windows-x64 on ubuntu)
+          # produces a binary whose embedded Bun runtime does not correctly
+          # initialise the Windows console (SetConsoleMode flags), breaking
+          # mouse tracking, text selection, copy/paste, and bracketed paste.
+          # No windows-arm64: Bun has no such target; ARM64 Windows runs x64
+          # under emulation.
+          - target: windows-x64
+            os: windows-latest
+            ext: .exe
+          # Baseline variant: Bun's x64 binary now ships a single build that
+          # targets Nehalem (SSE4.2) and selects AVX2/AVX-512 code paths at
+          # runtime, so -baseline resolves to the same binary. We keep the
+          # artifact name for backward compatibility with existing installers.
+          # Built natively to avoid Bun's EPERM cache bug on Windows
+          # (oven-sh/bun#11198) which breaks --target cross-compilation.
+          - target: windows-x64-baseline
+            os: windows-latest
+            ext: .exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      # react-devtools-core is a devDependency and a peer of ink, so
+      # `pnpm install` already puts it where Bun's resolver finds it. The
+      # separate `bun install` this used to run wrote an extra entry into
+      # package.json mid-release for no gain.
+      - run: pnpm install --frozen-lockfile
+      # The bundled skills are Markdown, so `bun build` cannot carry them along
+      # and a compiled binary cannot read them off disk either — it resolves
+      # import.meta.url into Bun's virtual filesystem. They are inlined into a
+      # generated module instead. This job compiles from source directly rather
+      # than through `pnpm build` or build-binary.sh, so it has to regenerate
+      # here too, or every published binary ships whatever text was committed.
+      - name: Generate bundled skills manifest
+        run: node scripts/gen-bundled-skills.mjs
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          # Cross-compile for non-native targets. A host-target build embeds
+          # whichever native .node addons happen to resolve locally, while the
+          # cross toolchain silently drops the ones that do not resolve for
+          # the target — which is how the macOS binaries ended up ~27MB
+          # heavier than the others and how the two halves of the matrix
+          # stopped behaving alike.
+          #
+          # Both Windows targets build natively (no --target). Cross-compiling
+          # from Linux breaks console initialisation, and --target on Windows
+          # hits Bun's EPERM cache bug (oven-sh/bun#11198). Since Bun's x64
+          # binary now auto-selects AVX2 code paths at runtime, -baseline and
+          # the standard build produce the same binary anyway.
+          if [[ "${{ matrix.target }}" == windows-* ]]; then
+            bun build source/cli.tsx --compile --outfile dist/agav-${{ matrix.target }}${{ matrix.ext }}
+          else
+            bun build source/cli.tsx --compile --target=bun-${{ matrix.target }} --outfile dist/agav-${{ matrix.target }}${{ matrix.ext }}
+          fi
+      - name: Sign binary (macOS)
+        if: startsWith(matrix.target, 'darwin')
+        run: |
+          codesign --sign - --force --timestamp dist/agav-${{ matrix.target }}
+          echo "macOS ad-hoc signed."
+
+      - name: Sign binary (Linux - cosign)
+        if: startsWith(matrix.target, 'linux')
+        continue-on-error: true
+        run: |
+          if command -v cosign >/dev/null 2>&1; then
+            cosign sign-blob --yes --output-signature dist/agav-${{ matrix.target }}.sig dist/agav-${{ matrix.target }}
+            echo "Linux binary signed with cosign."
+          else
+            echo "cosign not available, skipping signing."
+          fi
+
+      - name: Compress binary
+        run: |
+          # Published next to the raw binary, never in place of it: installers
+          # from earlier releases fetch the bare asset name and have to keep
+          # working. gzip rather than tar or zip because every client already
+          # decompresses it without an archive parser or any path handling —
+          # `gzip -d`, Node's zlib, and PowerShell's GZipStream. -n drops the
+          # name and mtime so the same input produces the same bytes.
+          cd dist
+          gzip -9 -k -n "agav-${{ matrix.target }}${{ matrix.ext }}"
+          ls -lh "agav-${{ matrix.target }}${{ matrix.ext }}" "agav-${{ matrix.target }}${{ matrix.ext }}.gz"
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then hash() { sha256sum "$1"; }; else hash() { shasum -a 256 "$1"; }; fi
+          for asset in "agav-${{ matrix.target }}${{ matrix.ext }}" "agav-${{ matrix.target }}${{ matrix.ext }}.gz"; do
+            hash "$asset" > "$asset.sha256"
+            cat "$asset.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: agav-${{ matrix.target }}
+          path: |
+            dist/agav-${{ matrix.target }}${{ matrix.ext }}
+            dist/agav-${{ matrix.target }}${{ matrix.ext }}.sha256
+            dist/agav-${{ matrix.target }}${{ matrix.ext }}.gz
+            dist/agav-${{ matrix.target }}${{ matrix.ext }}.gz.sha256
+            dist/agav-${{ matrix.target }}.sig
+
+  release:
+    name: Create Release
+    needs: [check-version, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN }}
+          fetch-depth: 0
+      # No README badge commit here. The version badge reads package.json from
+      # the default branch through shields.io, so it tracks the release without
+      # a commit. The previous step pushed a rewritten badge straight to main,
+      # which the branch ruleset rejects with GH013, and it swallowed that
+      # failure as a warning — so the badge silently stopped tracking after
+      # 0.1.2 while every release still reported success.
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/agav-*; do
+            target=$(basename "$dir")
+            # The artifact dir is named after the target, but the Windows
+            # binary inside it carries a .exe suffix, so try both.
+            for asset in "$target" "$target.exe"; do
+              [ -f "$dir/$asset" ] || continue
+              # Copy binary
+              cp "$dir/$asset" "release/$asset"
+              chmod +x "release/$asset"
+              # Copy the compressed binary, checksums, and signatures
+              for ext in sha256 sig gz gz.sha256; do
+                if [ -f "$dir/${asset}.${ext}" ]; then
+                  cp "$dir/${asset}.${ext}" "release/${asset}.${ext}"
+                fi
+              done
+            done
+          done
+          # Generate combined SHA256SUMS file. Both the raw and the compressed
+          # binary get a line; the detached .sha256 and .sig files do not.
+          cd release
+          sha256sum agav-* 2>/dev/null | grep -v -e '\.sha256$' -e '\.sig$' -e '\.sigstore$' > SHA256SUMS || true
+          cat SHA256SUMS
+          cd ..
+          ls -lh release/
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          NOTES=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
+          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            ## Changes
+
+            ${{ steps.notes.outputs.notes }}
+
+            ## Installation
+
+            Both installers verify the SHA-256 checksum of the download and
+            refuse to install if it does not match.
+
+            ### macOS / Linux
+
+            ```bash
+            curl -fsSL https://agav.dev/install.sh | bash
+            ```
+
+            ### Windows
+
+            ```powershell
+            irm https://www.agav.dev/install.ps1 | iex
+            ```
+
+            The `www.` is deliberate: the apex answers with a 308 and Windows
+            PowerShell 5.1 cannot follow that status.
+
+            <details>
+            <summary>Manual install</summary>
+
+            Every binary is also published gzipped as `<asset>.gz`, about a
+            third of the size. The installers fetch that and fall back to the
+            raw asset; the digest below is the raw asset's either way, so
+            verify after decompressing.
+
+            **macOS / Linux** — pick one of `agav-darwin-arm64`,
+            `agav-darwin-x64`, `agav-linux-x64`, `agav-linux-arm64`.
+
+            ```bash
+            BASE="https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}"
+            ASSET="agav-darwin-arm64"
+
+            curl -fsSL "$BASE/$ASSET" -o agav
+            curl -fsSL "$BASE/$ASSET.sha256" -o agav.sha256
+
+            # Fail closed: install nothing unless the published digest matches.
+            if command -v sha256sum >/dev/null 2>&1; then CHECK="sha256sum -c"; else CHECK="shasum -a 256 -c"; fi
+            if sed "s| $ASSET| agav|" agav.sha256 | $CHECK -; then
+              chmod +x agav && sudo mv agav /usr/local/bin/agav
+            else
+              echo "Checksum mismatch - refusing to install." && rm -f agav
+            fi
+            rm -f agav.sha256
+            ```
+
+            **Windows** — x64 only; ARM64 runs the x64 build under emulation.
+            Close any running agav first: Windows will not let a loaded .exe be
+            overwritten.
+
+            ```powershell
+            $dir = "$env:LOCALAPPDATA\agav"
+            $base = "https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+            # .NET below 4.7 negotiates TLS 1.0, which github.com refuses.
+            # -UseBasicParsing keeps this off the IE engine, absent on Server Core.
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -UseBasicParsing -Uri "$base/agav-windows-x64.exe" -OutFile "$dir\agav.exe.tmp"
+
+            # Verify before running it. Fail closed.
+            $expected = (((Invoke-WebRequest -UseBasicParsing -Uri "$base/agav-windows-x64.exe.sha256").Content) -split '\s+')[0]
+            if ((Get-FileHash "$dir\agav.exe.tmp" -Algorithm SHA256).Hash -ne $expected.ToUpperInvariant()) {
+              Remove-Item "$dir\agav.exe.tmp" -Force
+              throw "Checksum mismatch - refusing to install."
+            }
+            Move-Item "$dir\agav.exe.tmp" "$dir\agav.exe" -Force
+
+            # Add to PATH (run once). Write the registry value directly:
+            # [Environment]::GetEnvironmentVariable returns PATH already expanded,
+            # so writing it back bakes every %USERPROFILE%-style entry into a
+            # literal path and flattens a REG_EXPAND_SZ PATH permanently.
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+            $raw = [string]$key.GetValue("PATH", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $kind = if ($raw) { $key.GetValueKind("PATH") } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+            # Compare whole segments. `-like "*$dir*"` treats $dir as a wildcard
+            # pattern and matches substrings, so an unrelated "C:\agav-old"
+            # already on PATH would silently suppress the edit.
+            $onPath = @($raw.Split(';') | Where-Object { $_.Trim().Trim('"').TrimEnd('\') -eq $dir }).Count -gt 0
+            if (-not $onPath) {
+              $key.SetValue("PATH", $(if ($raw) { "$dir;$raw" } else { $dir }), $kind)
+            }
+            $key.Close()
+            $env:PATH = "$dir;$env:PATH"
+            ```
+
+            </details>
+          generate_release_notes: true
+          files: release/*
+
+      # Mirror every published asset to Cloudflare R2 so releases.agav.dev can
+      # serve them as the primary source, with GitHub Releases as the fallback
+      # (see docs/deploy/releases-mirror-setup.md and
+      # docs/deploy/releases-worker/). Runs AFTER the GitHub Release is created,
+      # so the fallback origin is never empty while R2 is being populated. If
+      # the R2 credentials are absent (e.g. on a fork), the sync is skipped
+      # rather than failing the release.
+      - name: Mirror release assets to R2
+        env:
+          TAG: v${{ needs.check-version.outputs.version }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ACCESS_KEY_ID:-}" ]; then
+            echo "R2 credentials not configured — skipping R2 mirror."
+            exit 0
+          fi
+          npm install --no-save @aws-sdk/client-s3@3
+          node scripts/mirror-release-to-r2.mjs "$TAG" release

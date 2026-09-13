@@ -1,0 +1,87 @@
+name: Agav PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main, beta]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: AI Code Review
+    if: github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.AGAV_APP_ID }}
+          private-key: ${{ secrets.AGAV_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Install Agav
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh release download --repo ${{ github.repository }} --pattern 'agav-linux-x64' --dir /tmp
+          install -m 755 /tmp/agav-linux-x64 /usr/local/bin/agav
+
+      - name: Check diff size
+        id: diff-size
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          FILE_COUNT=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files --paginate --jq 'length' | paste -sd+ - | bc)
+          echo "files=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$FILE_COUNT" -gt 300 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping AI review — PR has $FILE_COUNT files (limit: 300)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get PR diff
+        id: get-diff
+        if: steps.diff-size.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # `gh pr diff` refuses a diff carrying raw terminal escapes unless
+          # asked, since printing one to a terminal is an injection vector.
+          # This is a terminal app: escapes turn up in its sources and tests as
+          # a matter of course, and the diff goes to a file, not a terminal.
+          if ! gh pr diff --allow-escape-sequences ${{ github.event.pull_request.number }} > /tmp/pr-diff.txt 2>/tmp/pr-diff-err.txt; then
+            echo "::notice::Skipping AI review — could not fetch PR diff: $(cat /tmp/pr-diff-err.txt)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review with Agav
+        if: steps.diff-size.outputs.skip != 'true' && steps.get-diff.outputs.skip != 'true'
+        timeout-minutes: 3
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AGAV_NO_SANDBOX: "1"
+        run: |
+          head -c 30000 /tmp/pr-diff.txt | agav -P "Review this PR diff (provided via stdin) for bugs, security issues, and breaking changes only. Be concise. If no issues, say LGTM." --provider gemini --model gemini-3.5-flash-lite > review.md
+
+      - name: Post review
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ ! -f review.md ]; then exit 0; fi
+          REVIEW=$(cat review.md)
+          if [ -n "$REVIEW" ]; then
+            gh pr review ${{ github.event.pull_request.number }} --comment --body "$REVIEW"
+          fi

@@ -1,0 +1,529 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, beta]
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  # --- Change detection ---
+  changed:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.diff.outputs.source }}
+      workflows: ${{ steps.diff.outputs.workflows }}
+      docs: ${{ steps.diff.outputs.docs }}
+      deps: ${{ steps.diff.outputs.deps }}
+      scripts: ${{ steps.diff.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+          fetch-depth: 0
+      - name: Compute changed paths
+        id: diff
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FILES=$(git diff --name-only "$BASE" "$HEAD")
+          echo "source=false" >> "$GITHUB_OUTPUT"
+          echo "workflows=false" >> "$GITHUB_OUTPUT"
+          echo "docs=false" >> "$GITHUB_OUTPUT"
+          echo "deps=false" >> "$GITHUB_OUTPUT"
+          echo "scripts=false" >> "$GITHUB_OUTPUT"
+          if echo "$FILES" | grep -qE '^source/'; then
+            echo "source=true" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$FILES" | grep -qE '^\.github/'; then
+            echo "workflows=true" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$FILES" | grep -qE '(README|\.md$|docs/)'; then
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$FILES" | grep -qE '(package\.json|pnpm-lock\.yaml)'; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$FILES" | grep -qE '^scripts/'; then
+            echo "scripts=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --- Core checks (only when source or deps change) ---
+  typecheck:
+    name: Type Check
+    needs: changed
+    if: needs.changed.outputs.source == 'true' || needs.changed.outputs.deps == 'true' || needs.changed.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: npx tsc --noEmit
+      - name: Check clean worktree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Build modified source files:"
+            git diff --name-only
+            exit 1
+          fi
+
+  build:
+    name: Build Check
+    needs: changed
+    if: needs.changed.outputs.source == 'true' || needs.changed.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: npx tsx source/cli.tsx -- --version
+      - name: Check clean worktree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Build modified source files:"
+            git diff --name-only
+            exit 1
+          fi
+
+  test:
+    name: Tests
+    needs: changed
+    if: needs.changed.outputs.source == 'true' || needs.changed.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # `pnpm build` regenerates the bundled-skills manifest. If that changed
+      # anything, the committed copy was stale — which a source checkout and
+      # `bun build` both use as-is. Fail here rather than ship the old text.
+      - name: Check bundled skills manifest is up to date
+        run: |
+          if ! git diff --exit-code -- source/skills/bundled-manifest.ts; then
+            echo "::error::source/skills/bundled-manifest.ts is stale. Run 'pnpm gen:skills' and commit the result."
+            exit 1
+          fi
+      - run: npx vitest run --passWithNoTests
+
+  binary-size:
+    name: Binary Size
+    needs: changed
+    if: needs.changed.outputs.source == 'true' || needs.changed.outputs.deps == 'true' || needs.changed.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      # Only pnpm, deliberately: the release workflow no longer runs a separate
+      # `bun install react-devtools-core`, so this is the check that the ink
+      # devtools import still resolves through pnpm's peer layout. A compiled
+      # binary that cannot find it dies at startup, not at build time, which is
+      # exactly the class of break that used to reach a release.
+      - run: pnpm install --frozen-lockfile
+      # Mirror the release: it regenerates the inlined bundled skills before
+      # compiling, so measuring without them would understate what ships.
+      - run: node scripts/gen-bundled-skills.mjs
+      - name: Compile and measure
+        run: |
+          # Same target and flags the release uses, so the number here is the
+          # number users download. linux-x64 stands in for the matrix: the
+          # difference between targets is the embedded Bun runtime, which no
+          # pull request can change.
+          mkdir -p dist
+          bun build source/cli.tsx --compile --target=bun-linux-x64 --outfile dist/agav-linux-x64
+          gzip -9 -k -n dist/agav-linux-x64
+
+          RAW=$(wc -c < dist/agav-linux-x64)
+          GZ=$(wc -c < dist/agav-linux-x64.gz)
+          # ~99 MiB of this is the embedded Bun runtime and is not ours to
+          # shrink. The budget leaves room for a few MB of growth and trips on
+          # the kind of regression that added 30 MB of native image codecs.
+          BUDGET=$((110 * 1024 * 1024))
+
+          {
+            echo "| Asset | Bytes | MiB |"
+            echo "| --- | ---: | ---: |"
+            echo "| agav-linux-x64 | $RAW | $((RAW / 1048576)) |"
+            echo "| agav-linux-x64.gz | $GZ | $((GZ / 1048576)) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RAW" -gt "$BUDGET" ]; then
+            echo "::error::agav-linux-x64 is $RAW bytes, over the $BUDGET byte budget."
+            exit 1
+          else
+            echo "agav-linux-x64: $RAW bytes (budget $BUDGET), compressed $GZ bytes."
+          fi
+      - name: Smoke-test the compiled binary
+        # A binary that builds but cannot start is the failure this job exists
+        # to catch, and --version exercises the whole module graph's top level.
+        run: ./dist/agav-linux-x64 --version
+
+  # --- Installer scripts ---
+  # These ship outside the release pipeline (hand-copied to agav.dev), so
+  # nothing else in this workflow would ever look at them.
+  installer-sh:
+    name: Installer Tests (sh)
+    needs: changed
+    if: needs.changed.outputs.scripts == 'true' || needs.changed.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: ShellCheck
+        run: |
+          shellcheck -s sh \
+            scripts/install.sh \
+            scripts/tests/install-sh.test.sh \
+            scripts/tests/install-sh-path.test.sh \
+            scripts/tests/run-installer-tests.sh
+      - name: Install the other /bin/sh implementations
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends dash busybox
+      - name: Run the suites under every shell
+        # install.sh is `#!/bin/sh`, and which shell that is depends entirely on
+        # the distro: dash on Debian and Ubuntu, bash on Fedora, ash in Alpine.
+        run: |
+          FAIL=0
+          for shell in dash bash "busybox sh"; do
+            echo "::group::$shell"
+            $shell scripts/tests/install-sh.test.sh || FAIL=1
+            $shell scripts/tests/install-sh-path.test.sh || FAIL=1
+            echo "::endgroup::"
+          done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+
+  installer-ps1:
+    name: Installer Tests (PowerShell)
+    needs: changed
+    if: needs.changed.outputs.scripts == 'true' || needs.changed.outputs.workflows == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: Suites under Windows PowerShell 5.1
+        # This is the host install.cmd actually launches, and the only place the
+        # registry half of the PATH handling runs for real. The suite captures
+        # HKCU\Environment\PATH first and puts it back afterwards.
+        shell: powershell
+        run: |
+          $Fail = 0
+          foreach ($Suite in @("install-ps1.test.ps1", "install-ps1-path.test.ps1")) {
+            Write-Host "::group::5.1 $Suite"
+            & powershell -NoProfile -File "scripts\tests\$Suite"
+            if ($LASTEXITCODE -ne 0) { $Fail = 1 }
+            Write-Host "::endgroup::"
+          }
+          exit $Fail
+      - name: Suites under pwsh 7
+        shell: pwsh
+        run: |
+          $Fail = 0
+          foreach ($Suite in @("install-ps1.test.ps1", "install-ps1-path.test.ps1", "install-ps1-lint.test.ps1")) {
+            Write-Host "::group::pwsh $Suite"
+            & pwsh -NoProfile -File "scripts\tests\$Suite"
+            if ($LASTEXITCODE -ne 0) { $Fail = 1 }
+            Write-Host "::endgroup::"
+          }
+          exit $Fail
+
+  # --- Always-run checks ---
+  pr-title:
+    name: PR Title Lint
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN || github.token }}
+        with:
+          types: |
+            feat
+            fix
+            refactor
+            docs
+            chore
+            test
+            perf
+            ci
+          requireScope: false
+
+  secret-scan:
+    name: Secret Leak Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+          fetch-depth: 0
+      - name: Scan for leaked secrets
+        run: |
+          echo "Scanning for hardcoded secrets..."
+          FAIL=0
+          if grep -rn --include='*.ts' --include='*.tsx' --include='*.json' --include='*.env' \
+            -E '(sk-ant-|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY)' \
+            source/ .github/ 2>/dev/null | grep -v 'node_modules' | grep -v '.test.' | grep -v 'sk-ant-\.\.\.' | grep -v 'sk-\.\.\.'; then
+            echo "::error::Potential secrets found in source files"
+            FAIL=1
+          fi
+          if find . -name '.env' -not -path '*/node_modules/*' -not -path '*/.git/*' | grep -q .; then
+            echo "::error::Found .env file(s) — these should be gitignored"
+            FAIL=1
+          fi
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+          echo "No secrets detected."
+
+  blob-size:
+    name: Blob Size Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+          fetch-depth: 0
+      - name: Check for oversized files
+        run: |
+          MAX_BYTES=512000
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FAIL=0
+          for file in $(git diff --name-only --diff-filter=ACM "$BASE" "$HEAD"); do
+            if [ -f "$file" ]; then
+              size=$(wc -c < "$file")
+              if [ "$size" -gt "$MAX_BYTES" ]; then
+                echo "::error file=$file::$file is ${size} bytes (max: ${MAX_BYTES})"
+                FAIL=1
+              fi
+            fi
+          done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+          echo "All files within size limits."
+
+  security-patterns:
+    name: Dangerous Pattern Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: Scan for dangerous code patterns
+        run: |
+          echo "Scanning for dangerous patterns in source..."
+          FAIL=0
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E '\beval\s*\(|new\s+Function\s*\(' source/ 2>/dev/null | grep -v 'node_modules' | grep -v '\.test\.'; then
+            echo "::error::eval() or new Function() found — code injection risk"
+            FAIL=1
+          fi
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E 'exec(File|Sync|Async)?\s*\(\s*`' source/ 2>/dev/null | grep -v 'node_modules'; then
+            echo "::error::Shell exec with template literal — command injection risk"
+            FAIL=1
+          fi
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E 'rejectUnauthorized\s*:\s*false|NODE_TLS_REJECT_UNAUTHORIZED.*0' source/ 2>/dev/null \
+            | grep -v 'cli.tsx'; then
+            echo "::error::TLS verification disabled — MITM risk"
+            FAIL=1
+          fi
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E 'innerHTML|dangerouslySetInnerHTML' source/ 2>/dev/null; then
+            echo "::error::innerHTML usage found — XSS risk"
+            FAIL=1
+          fi
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+          echo "No dangerous patterns detected."
+
+  dependency-audit:
+    name: Dependency Vulnerability Audit
+    needs: changed
+    if: needs.changed.outputs.deps == 'true' || needs.changed.outputs.source == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod || echo "::warning::Dependency vulnerabilities found"
+
+  lockfile-integrity:
+    name: Lockfile Integrity
+    needs: changed
+    if: needs.changed.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: Verify lockfile exists
+        run: |
+          if [ ! -f pnpm-lock.yaml ]; then
+            echo "::error::pnpm-lock.yaml missing"
+            exit 1
+          fi
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+
+  semgrep:
+    name: SAST (Semgrep)
+    needs: changed
+    if: needs.changed.outputs.source == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - run: |
+          semgrep scan \
+            --config "p/javascript" \
+            --config "p/typescript" \
+            --config "p/owasp-top-ten" \
+            --config "p/nodejs" \
+            --config "p/command-injection" \
+            --config "p/xss" \
+            --error \
+            source/
+
+  sensitive-files:
+    name: Sensitive File Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: Check sensitive files are not tracked
+        run: |
+          FAIL=0
+          PATTERNS=('.env' '.env.local' '.env.production' '*.pem' '*.key' '*.p12' '*.pfx'
+                    'credentials.json' 'service-account.json' 'id_rsa' 'id_ed25519')
+          for pattern in "${PATTERNS[@]}"; do
+            matches=$(git ls-files "$pattern" 2>/dev/null)
+            if [ -n "$matches" ]; then
+              echo "::error::Sensitive file tracked: $matches"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+          echo "No sensitive files tracked."
+
+  readme-badges:
+    name: README Badge Freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          token: ${{ secrets.TOKEN || github.token }}
+      - name: Check the version badge is derived, not hardcoded
+        run: |
+          # A literal shields.io/badge/version-x.y.z badge has to be rewritten
+          # on every release. The release workflow used to do that by pushing
+          # to main, the ruleset rejected it, and the badge sat at 0.1.2 for
+          # six releases. Keep the badge derived from package.json instead.
+          if grep -nE 'img\.shields\.io/badge/version-' README.md; then
+            echo "::error file=README.md::Hardcoded version badge. Use https://img.shields.io/github/package-json/v/${{ github.repository }} so the badge tracks package.json."
+            exit 1
+          fi
+          if ! grep -q 'img\.shields\.io/github/package-json/v/' README.md; then
+            echo "::error file=README.md::The derived version badge is missing from README.md."
+            exit 1
+          fi
+          echo "Version badge is derived from package.json."
+
+  # --- Terminal gate ---
+  required:
+    name: All Checks
+    if: always()
+    needs:
+      - typecheck
+      - build
+      - test
+      - binary-size
+      - installer-sh
+      - installer-ps1
+      - pr-title
+      - secret-scan
+      - blob-size
+      - security-patterns
+      - dependency-audit
+      - lockfile-integrity
+      - semgrep
+      - sensitive-files
+      - readme-badges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        run: |
+          echo "Check results:"
+          FAIL=0
+          for result in \
+            "${{ needs.typecheck.result }}" \
+            "${{ needs.build.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.binary-size.result }}" \
+            "${{ needs.installer-sh.result }}" \
+            "${{ needs.installer-ps1.result }}" \
+            "${{ needs.pr-title.result }}" \
+            "${{ needs.secret-scan.result }}" \
+            "${{ needs.blob-size.result }}" \
+            "${{ needs.security-patterns.result }}" \
+            "${{ needs.dependency-audit.result }}" \
+            "${{ needs.lockfile-integrity.result }}" \
+            "${{ needs.semgrep.result }}" \
+            "${{ needs.sensitive-files.result }}" \
+            "${{ needs.readme-badges.result }}"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::Check failed: $result"; FAIL=1 ;;
+            esac
+          done
+          if [ "$FAIL" -eq 1 ]; then exit 1; fi
+          echo "All checks passed."
